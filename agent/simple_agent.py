@@ -123,8 +123,8 @@ class SimpleAgent:
             api_key=SAMBANOVA_API_KEY
         )
         self.running = True
-        # Initial message content is now a list to allow appending visual context.
-        self.message_history = [{"role": "user", "content": [{"type": "text", "text": "You may now begin playing. Describe what you see and what you plan to do."}]}]
+        # Initial message content is a string.
+        self.message_history = [{"role": "user", "content": "You may now begin playing. Describe what you see and what you plan to do."}]
         self.max_history = max_history
         if load_state:
             logger.info(f"Loading saved state from {load_state}")
@@ -253,44 +253,78 @@ class SimpleAgent:
             
             initial_visual_description = self.get_visual_context_for_action_model(screenshot_b64, memory_info, collision_map_str)
             
-            # Augment the initial user message with this visual context
-            self.message_history[0]["content"].append({"type": "text", "text": f"\nInitial Observation:\n{initial_visual_description}"})
+            # Augment the initial user message string with the first visual description.
+            self.message_history[0]["content"] += f"\n\nInitial Observation:\n{initial_visual_description}"
 
         while self.running and steps_completed < num_steps:
             try:
-                # Step 1: Get current visual context for the ACTION_MODEL, unless it's the first turn and already augmented.
-                # For subsequent turns, or if the first message wasn't augmented (e.g. loading from state).
-                if not (steps_completed == 0 and len(self.message_history) == 1 and self.message_history[0]["content"][-1]["type"] == "text" and "Initial Observation" in self.message_history[0]["content"][-1]["text"]):
-                    logger.info("Getting current visual context for action model...")
-                    current_screenshot = self.emulator.get_screenshot()
-                    current_screenshot_b64 = get_screenshot_base64(current_screenshot, upscale=2)
-                    current_memory_info = self.emulator.get_state_from_memory()
-                    current_collision_map = self.emulator.get_collision_map()
-                    current_collision_map_str = f"\n{current_collision_map}" if current_collision_map else ""
-                    
-                    visual_description = self.get_visual_context_for_action_model(
-                        current_screenshot_b64, 
-                        current_memory_info,
-                        current_collision_map_str
-                    )
-                    # Add the visual description as a new user message part for the action model
-                    new_user_content_block = {"type": "text", "text": f"Current Observation:\n{visual_description}"}
-                    
-                    # Append to last user message if possible, or create new user message
-                    if self.message_history and self.message_history[-1]["role"] == "user":
-                        if isinstance(self.message_history[-1]["content"], list):
-                            self.message_history[-1]["content"].append(new_user_content_block)
-                        else: # Should not happen if __init__ sets content to list
-                             self.message_history[-1]["content"] = [{"type":"text", "text": self.message_history[-1]["content"]}, new_user_content_block]
-                    else:
-                        self.message_history.append({"role": "user", "content": [new_user_content_block]})
+                # Construct the user message string for the current turn
+                user_content_parts = []
 
-                current_messages_for_action_model = copy.deepcopy(self.message_history)
+                # If the last message was a tool result, prepend its content.
+                # The deepcopy of message_history for the API call will happen after this potential modification.
+                if self.message_history and self.message_history[-1]["role"] == "tool":
+                    # We take the tool message content and remove it from history,
+                    # as its content will be part of the new user message.
+                    last_tool_message = self.message_history.pop() 
+                    tool_name = last_tool_message.get("name", "Unknown tool")
+                    tool_output_string = last_tool_message.get("content", "No content from tool.")
+                    user_content_parts.append(f"Tool execution result for '{tool_name}':\n{tool_output_string}")
+
+                # Get current visual and memory context
+                current_screenshot = self.emulator.get_screenshot()
+                current_screenshot_b64 = get_screenshot_base64(current_screenshot, upscale=2)
+                current_memory_info = self.emulator.get_state_from_memory() # String from emulator
+                current_collision_map = self.emulator.get_collision_map()
+                current_collision_map_str = f"\n{current_collision_map}" if current_collision_map else ""
                 
-                # The system prompt is now part of the messages list for OpenAI
-                payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + current_messages_for_action_model
+                visual_description = self.get_visual_context_for_action_model(
+                    current_screenshot_b64, 
+                    current_memory_info,
+                    current_collision_map_str
+                )
+                user_content_parts.append(f"Current Observation:\n{visual_description}")
+                user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}") # Add memory info as part of the string
+
+                final_user_content_string = "\n\n".join(user_content_parts)
+
+                # Update message history for the API call
+                # The history sent to the API should reflect the latest state.
+                messages_for_api = copy.deepcopy(self.message_history)
+
+                # If the last message in messages_for_api is a user message (e.g. the initial one, or from summary),
+                # and we are not on the very first step where initial augmentation happened,
+                # then append the new context to it. Otherwise, add a new user message.
+                is_initial_turn_with_augmented_message = (steps_completed == 0 and \
+                                                       len(messages_for_api) == 1 and \
+                                                       messages_for_api[0]["role"] == "user" and \
+                                                       "Initial Observation" in messages_for_api[0]["content"])
                 
-                logger.info(f"Calling {ACTION_MODEL_NAME} with history of {len(payload_messages)} messages (incl. system).")
+                if not messages_for_api or messages_for_api[-1]["role"] != "user":
+                    messages_for_api.append({"role": "user", "content": final_user_content_string})
+                elif not is_initial_turn_with_augmented_message : 
+                    # Last message is 'user', but it's not the initial one that was just augmented.
+                    # This could be a user message from a summary, or if a turn somehow didn't add one.
+                    # Append new context to existing user message content.
+                     messages_for_api[-1]["content"] += f"\n\n{final_user_content_string}"
+                # If it IS the initial_turn_with_augmented_message, its content is already set from pre-loop.
+                # final_user_content_string was constructed based on the latest state,
+                # and the initial message in self.message_history was already updated.
+                # So, messages_for_api (a copy of self.message_history) is up-to-date for the first turn.
+                # For subsequent turns, this logic correctly appends or adds new user message.
+
+                # Safeguard: Ensure all user/system/tool messages have string content
+                processed_messages_for_api = []
+                for msg in messages_for_api:
+                    if msg["role"] in ["user", "system", "tool"]:
+                        if not isinstance(msg["content"], str):
+                            logger.warning(f"Message role {msg['role']} had non-string content: {type(msg['content'])}. Converting to string.")
+                            msg["content"] = str(msg["content"])
+                    processed_messages_for_api.append(msg)
+                
+                payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + processed_messages_for_api
+                
+                logger.info(f"Calling {ACTION_MODEL_NAME}. Last user message content: {payload_messages[-1]['content'][:250] if payload_messages and payload_messages[-1]['role'] == 'user' else 'N/A...'}")
                 response = self.client.chat.completions.create(
                     model=ACTION_MODEL_NAME,
                     max_tokens=MAX_TOKENS,
@@ -300,46 +334,54 @@ class SimpleAgent:
                     temperature=TEMPERATURE,
                 )
 
+                logger.info(f"Full API response object: {response}")
                 response_message = response.choices[0].message
                 if response.usage: 
                     logger.info(f"Response usage: Input tokens: {response.usage.prompt_tokens}, Output tokens: {response.usage.completion_tokens}")
 
-                assistant_response_content_parts = []
+                # Process response: assistant text and tool calls
+                # Assistant message content parts (text or tool_call dicts)
+                assistant_response_content_for_history = []
                 if response_message.content: 
                     logger.info(f"[Assistant Text] {response_message.content}")
-                    assistant_response_content_parts.append({"type": "text", "text": response_message.content})
+                    # For DeepSeek, assistant content for history should also be simple string if no tools.
+                    # However, if there are tool_calls, OpenAI standard is list of parts.
+                    # For now, let's assume DeepSeek handles list if tool_calls are present, or string if only text.
+                    # The subtask implies string for USER and SYSTEM. Assistant messages are handled by OpenAI library.
+                    # The important part is that what WE construct for user/system is string.
+                    assistant_response_content_for_history.append({"type": "text", "text": response_message.content})
                 
                 tool_calls_from_response = response_message.tool_calls
 
                 if tool_calls_from_response:
                     for tool_call_obj in tool_calls_from_response: 
                         logger.info(f"[Assistant Tool Call] ID: {tool_call_obj.id}, Function: {tool_call_obj.function.name}, Args: {tool_call_obj.function.arguments}")
-                        assistant_response_content_parts.append({
-                            "type": "tool_call", 
+                        assistant_response_content_for_history.append({
+                            "type": "tool_call", # This is our internal representation
                             "id": tool_call_obj.id,
-                            "function": { 
+                            "function": { # Mimicking OpenAI's structure for consistency
                                 "name": tool_call_obj.function.name,
                                 "arguments": tool_call_obj.function.arguments 
                             }
                         })
                 
-                if assistant_response_content_parts: 
-                    self.message_history.append({
+                if assistant_response_content_for_history: 
+                    self.message_history.append({ # Add assistant's turn to history
                         "role": "assistant",
-                        "content": assistant_response_content_parts 
+                        "content": assistant_response_content_for_history # This can be a list of text/tool_call parts
                     })
                 
                 if tool_calls_from_response:
                     for tool_call_obj in tool_calls_from_response: 
                         tool_result_string = self.process_tool_call(tool_call_obj) 
                         
-                        self.message_history.append({
+                        self.message_history.append({ # Add tool result to history
                             "role": "tool", 
                             "tool_call_id": tool_call_obj.id, 
                             "name": tool_call_obj.function.name, 
-                            "content": tool_result_string, 
+                            "content": tool_result_string, # This is already a string
                         })
-                # After processing tool calls, the loop will restart, get new visual context, and append it as user message.
+                # The next iteration will construct a new user message with latest observations + this tool result.
 
                 if len(self.message_history) >= self.max_history:
                     self.summarize_history()
@@ -393,11 +435,11 @@ class SimpleAgent:
             {
                 "role": "user", 
                 "content": [
-                    {"type": "text", "text": f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"},
-                    {"type": "text", "text": f"\nLatest Game Context (after summary):\n{current_visual_text_description}"},
-                    # Image itself is no longer sent; relying on text description.
-                    {"type": "text", "text": "You were just asked to summarize your playthrough. The summary and current game context are above. Continue playing."}
-                ]
+                    # Ensure the user message created after summary is a single string.
+                    (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
+                     f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
+                     "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
+                )
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
