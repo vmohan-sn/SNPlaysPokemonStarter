@@ -1,5 +1,5 @@
 # Core requirements
-anthropic>=0.39.0  # For Claude API
+openai
 pyboy==2.2.0       # For Pokemon emulator
 
 # Image processing
