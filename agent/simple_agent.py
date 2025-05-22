@@ -323,7 +323,8 @@ class SimpleAgent:
                     processed_messages_for_api.append(msg)
                 
                 payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + processed_messages_for_api
-                
+                print(payload_messages)
+
                 logger.info(f"Calling {ACTION_MODEL_NAME}. Last user message content: {payload_messages[-1]['content'][:250] if payload_messages and payload_messages[-1]['role'] == 'user' else 'N/A...'}")
                 response = self.client.chat.completions.create(
                     model=ACTION_MODEL_NAME,
@@ -368,7 +369,7 @@ class SimpleAgent:
                 if assistant_response_content_for_history: 
                     self.message_history.append({ # Add assistant's turn to history
                         "role": "assistant",
-                        "content": assistant_response_content_for_history # This can be a list of text/tool_call parts
+                        "content": f"{assistant_response_content_for_history}" # This can be a list of text/tool_call parts
                     })
                 
                 if tool_calls_from_response:
@@ -415,7 +416,7 @@ class SimpleAgent:
         summary_request_messages = copy.deepcopy(self.message_history)
         summary_request_messages.append({ 
             "role": "user",
-            "content": [{"type": "text", "text": SUMMARY_PROMPT}], 
+            "content": SUMMARY_PROMPT, 
         })
         
         payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + summary_request_messages
@@ -439,7 +440,7 @@ class SimpleAgent:
                     (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
                      f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
                      "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                )
+                ]
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
