@@ -130,6 +130,39 @@ class SimpleAgent:
             logger.info(f"Loading saved state from {load_state}")
             self.emulator.load_state(load_state)
 
+    def _transform_messages_for_action_model(self, messages_history: list) -> list:
+        """
+        Transforms messages for ACTION_MODEL_NAME:
+        - User/System messages: Ensures 'content' is a string.
+        - Assistant/Tool messages: Kept as is.
+        """
+        transformed_messages = []
+        for msg in messages_history:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role in ["user", "system"]:
+                if isinstance(content, list):
+                    # Attempt to extract text from list structure
+                    # Common structure: [{"type": "text", "text": "..."}]
+                    text_content = ""
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
+                            text_content += item["text"] + "\n" # Concatenate if multiple text parts
+                    text_content = text_content.strip()
+                    if not text_content: # Fallback if list is empty or no text parts found
+                        logger.warning(f"User/System message content list did not yield text: {content}")
+                        text_content = str(content) 
+                    transformed_messages.append({"role": role, "content": text_content})
+                elif isinstance(content, str):
+                    transformed_messages.append({"role": role, "content": content})
+                else:
+                    logger.warning(f"Unexpected content type for role {role}: {type(content)}. Converting to string.")
+                    transformed_messages.append({"role": role, "content": str(content)})
+            else: # assistant, tool, or other roles
+                transformed_messages.append(msg) # Keep as is
+        return transformed_messages
+
     def get_visual_context_for_action_model(self, screenshot_b64: str, memory_info: str, collision_map_str: str = None) -> str:
         """
         Calls the VISION_MODEL_NAME to get a textual description of the game state including screen, memory, and collision map.
@@ -313,18 +346,12 @@ class SimpleAgent:
                 # So, messages_for_api (a copy of self.message_history) is up-to-date for the first turn.
                 # For subsequent turns, this logic correctly appends or adds new user message.
 
-                # Safeguard: Ensure all user/system/tool messages have string content
-                processed_messages_for_api = []
-                for msg in messages_for_api:
-                    if msg["role"] in ["user", "system", "tool"]:
-                        if not isinstance(msg["content"], str):
-                            logger.warning(f"Message role {msg['role']} had non-string content: {type(msg['content'])}. Converting to string.")
-                            msg["content"] = str(msg["content"])
-                    processed_messages_for_api.append(msg)
+                # messages_for_api is the history built so far (already deepcopied and potentially modified)
+                # Now, transform it specifically for the action model
+                transformed_api_messages = self._transform_messages_for_action_model(messages_for_api)
                 
-                payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + processed_messages_for_api
-                print(payload_messages)
-
+                payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + transformed_api_messages
+                
                 logger.info(f"Calling {ACTION_MODEL_NAME}. Last user message content: {payload_messages[-1]['content'][:250] if payload_messages and payload_messages[-1]['role'] == 'user' else 'N/A...'}")
                 response = self.client.chat.completions.create(
                     model=ACTION_MODEL_NAME,
@@ -336,6 +363,25 @@ class SimpleAgent:
                 )
 
                 logger.info(f"Full API response object: {response}")
+
+                # ADD THIS BLOCK:
+                if response is None or not response.choices: # Checks if response itself is None OR if choices is None or empty
+                    logger.warning(
+                        "Received an empty or invalid response from action model (likely context length issue). "
+                        "Triggering summarization and retrying turn."
+                    )
+                    if len(self.message_history) <= 1: # Avoid summarizing if history is already minimal
+                        logger.error("History is too short to summarize further. Stopping agent to prevent loop.")
+                        self.running = False
+                    else:
+                        try:
+                            self.summarize_history()
+                        except Exception as e:
+                            logger.error(f"Error during summarization attempt: {e}. Stopping agent.")
+                            self.running = False
+                    continue # Skip the rest of this turn and try again
+                # END OF ADDED BLOCK
+                
                 response_message = response.choices[0].message
                 if response.usage: 
                     logger.info(f"Response usage: Input tokens: {response.usage.prompt_tokens}, Output tokens: {response.usage.completion_tokens}")
@@ -369,7 +415,7 @@ class SimpleAgent:
                 if assistant_response_content_for_history: 
                     self.message_history.append({ # Add assistant's turn to history
                         "role": "assistant",
-                        "content": f"{assistant_response_content_for_history}" # This can be a list of text/tool_call parts
+                        "content": assistant_response_content_for_history # This can be a list of text/tool_call parts
                     })
                 
                 if tool_calls_from_response:
@@ -415,16 +461,18 @@ class SimpleAgent:
         
         summary_request_messages = copy.deepcopy(self.message_history)
         summary_request_messages.append({ 
-            "role": "user",
-            "content": SUMMARY_PROMPT, 
+            "role": "user", # This will be transformed to string content by the helper
+            "content": [{"type": "text", "text": SUMMARY_PROMPT}], 
         })
         
-        payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + summary_request_messages
+        # Transform messages for the summarization call as well
+        transformed_summary_messages = self._transform_messages_for_action_model(summary_request_messages)
+        payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + transformed_summary_messages
         
         response = self.client.chat.completions.create( 
             model=ACTION_MODEL_NAME, 
             max_tokens=MAX_TOKENS, 
-            messages=payload_messages,
+            messages=payload_messages, # Pass transformed messages
             temperature=TEMPERATURE
         )
         
@@ -440,7 +488,7 @@ class SimpleAgent:
                     (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
                      f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
                      "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                ]
+                )
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
