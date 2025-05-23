@@ -507,7 +507,7 @@ class SimpleAgent:
                     max_tokens=MAX_TOKENS,
                     messages=payload_messages,
                     tools=AVAILABLE_TOOLS,
-                    tool_choice="auto", 
+                    tool_choice="required", 
                     temperature=TEMPERATURE,
                 )
 
