@@ -2,8 +2,10 @@ import base64
 import collections
 import copy
 import io
+import json # Added for parsing suggested buttons
 import logging
 import os
+import re # Added for parsing suggested buttons
 
 # Updated config import
 from config import (
@@ -20,6 +22,18 @@ from openai import OpenAI # Added
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+STRATEGIST_SYSTEM_PROMPT = """You are an expert Pokemon Red strategist. Your goal is to help the player make progress by defining immediate objectives and suggesting how to achieve them.
+
+Based on the current game observation (visuals, memory, map), you must:
+1.  Define the most critical immediate short-term objective. Be very specific (e.g., "My immediate objective is to exit this room through the door visible at the top of the screen." or "My immediate objective is to talk to the person standing in front of me.").
+2.  Briefly explain how this short-term objective contributes to long-term game progress (e.g., "This is necessary to start exploring Pallet Town and eventually receive my first Pokemon." or "This person might give me a crucial item or information to advance the story.").
+3.  Propose a specific sequence of button presses that you believe will achieve this immediate short-term objective. The button presses MUST be formatted as a JSON list of strings on a line that starts with 'Suggested Buttons: '. For example: `Suggested Buttons: ["up", "up", "a"]`.
+
+Your entire response should be a single text block.
+
+Example response:
+My immediate objective is to exit this room through the door visible at the top of the screen. This is the first step to explore Pallet Town and begin my Pokemon journey.
+Suggested Buttons: ["up", "up", "up"]"""
 
 def get_screenshot_base64(screenshot, upscale=1):
     """Convert PIL image to base64 string."""
@@ -38,11 +52,21 @@ SYSTEM_PROMPT = """You are playing Pokemon Red. You can see the game screen and 
 
 Your primary goal is to play through Pokemon Red and eventually defeat the Elite Four. Make decisions based on what you see on the screen and the information from your game memory.
 
-**Self-Correction and Learning:** If you notice your recent actions are not leading to meaningful progress (e.g., the environment doesn't change, you're repeatedly blocked, or you're not achieving your immediate objective), actively try different strategies. Re-evaluate the visual information, collision map, and memory data. If one approach (like moving in a specific direction repeatedly) isn't working, try alternative button presses, exploring different directions, or interacting with different objects.
+**Strategist Input and Your Role:**
+You will be provided with strategic guidance (a textual description of a short-term objective and its relevance) and potentially a *suggested button sequence* from a planning assistant (Strategist LLM). Your task is to critically analyze the current game state (screen, memory, map), the textual strategic guidance, and any suggested button sequence.
+
+Your decision-making process before each action should be:
+1.  **Understand the Goal:** Review the textual strategic guidance to understand the immediate short-term objective.
+2.  **Evaluate Suggested Buttons:** If a button sequence is suggested by the Strategist, assess its appropriateness and effectiveness in achieving the stated objective, considering the current visual information, memory, and map.
+3.  **Decide on Action:**
+    *   If the suggested buttons are good and directly help achieve the stated short-term goal, you should generally use them.
+    *   However, you have the authority to *deviate* from, *correct*, or *replace* the suggested buttons if they seem incorrect, inefficient, conflict with the current game state, or if you identify a better sequence to achieve the goal. Your own assessment of the live game state takes precedence.
+4.  **Explain Reasoning:** Briefly explain your reasoning for the chosen action, including why you are following, modifying, or disregarding any suggested buttons.
+5.  **Execute Action:** Your final output must be a tool call for the chosen button presses, using the 'press_buttons' tool (or 'navigate_to' if appropriate and available).
+
+**Self-Correction and Learning:** If you notice your recent actions are not leading to meaningful progress (e.g., the environment doesn't change, you're repeatedly blocked, or you're not achieving your immediate objective), actively try different strategies. Re-evaluate the visual information, collision map, memory data, and the Strategist's advice. If one approach isn't working, try alternative button presses, exploring different directions, or interacting with different objects.
 
 Early in the game (like when you first start or are in a new building), your objective is often to explore your immediate surroundings and find a way to the next area. This might involve looking for doors, stairs, or paths leading outwards. Pay attention to the 'Valid Moves' information from your memory, as it indicates directions you can immediately move.
-
-Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands. Consider your current objective, the available information (visuals, memory, valid moves), and your recent action history when deciding.
 
 The conversation history may occasionally be summarized to save context space. If you see a message labeled "CONVERSATION HISTORY SUMMARY", this contains the key information about your progress so far. Use this information to maintain continuity in your gameplay."""
 
@@ -149,17 +173,23 @@ class SimpleAgent:
 
             if role in ["user", "system"]:
                 if isinstance(content, list):
-                    # Attempt to extract text from list structure
-                    # Common structure: [{"type": "text", "text": "..."}]
-                    text_content = ""
+                    text_content_parts = []
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                            text_content += item["text"] + "\n" # Concatenate if multiple text parts
-                    text_content = text_content.strip()
-                    if not text_content: # Fallback if list is empty or no text parts found
-                        logger.warning(f"User/System message content list did not yield text: {content}")
-                        text_content = str(content) 
-                    transformed_messages.append({"role": role, "content": text_content})
+                            text_content_parts.append(item["text"])
+                        elif isinstance(item, str): # New condition
+                            text_content_parts.append(item)
+                        # Else: item is neither a text dict nor a string, potentially log or ignore
+                    
+                    if not text_content_parts:
+                        logger.warning(f"User/System message content list {content} yielded no text parts.")
+                        # Fallback to string representation of the original list, though this path should be less likely now.
+                        final_text_content = str(content) 
+                    else:
+                        # Join the parts. Use "\n" if multiple parts, otherwise just the single part.
+                        final_text_content = "\n".join(text_content_parts).strip()
+
+                    transformed_messages.append({"role": role, "content": final_text_content})
                 elif isinstance(content, str):
                     transformed_messages.append({"role": role, "content": content})
                 else:
@@ -344,10 +374,99 @@ class SimpleAgent:
                     current_memory_info,
                     current_collision_map_str # Pass it to vision model as before
                 )
+
+                # --- Begin Strategist LLM Call ---
+                strategic_suggestion = "No strategic suggestion obtained." # Default fallback
+                try:
+                    logger.info(f"Calling Strategist LLM ({ACTION_MODEL_NAME}) for strategic suggestion...")
+                    strategist_user_message_content = (
+                        f"Current Observation (from Vision Model):\n{visual_description}\n\n"
+                        f"Relevant Game Memory:\n{current_memory_info}\n\n"
+                    )
+                    if current_collision_map_str:
+                        strategist_user_message_content += f"Current Collision Map:\n{current_collision_map_str}\n\n"
+                    
+                    strategist_user_message_content += "Based on this, what is your strategic suggestion?"
+
+                    strategist_messages = [
+                        {"role": "system", "content": STRATEGIST_SYSTEM_PROMPT},
+                        {"role": "user", "content": strategist_user_message_content}
+                    ]
+                    
+                    # Transform messages for the Strategist LLM call
+                    transformed_strategist_messages = self._transform_messages_for_action_model(strategist_messages)
+
+                    strategist_response = self.client.chat.completions.create(
+                        model=ACTION_MODEL_NAME,
+                        messages=transformed_strategist_messages,
+                        max_tokens=MAX_TOKENS, # Or a more modest number if suggestions are short
+                        temperature=TEMPERATURE,
+                        # tools=None, # Explicitly no tools for strategist
+                        # tool_choice=None 
+                    )
+                    
+                    if strategist_response.choices and strategist_response.choices[0].message.content:
+                        strategic_suggestion = strategist_response.choices[0].message.content.strip()
+                        logger.info(f"Strategic Suggestion: {strategic_suggestion}")
+                        if strategist_response.usage:
+                            logger.info(f"Strategist LLM usage: Input tokens: {strategist_response.usage.prompt_tokens}, Output tokens: {strategist_response.usage.completion_tokens}")
+                    else:
+                        logger.warning("Strategist LLM returned no content or empty choices.")
+                
+                except Exception as e:
+                    logger.error(f"Error calling Strategist LLM ({ACTION_MODEL_NAME}): {e}", exc_info=True)
+                    strategic_suggestion = "Error obtaining strategic suggestion." # Fallback on error
+                # --- End Strategist LLM Call ---
+
+                # --- Parse Strategist LLM Output ---
+                textual_strategic_advice = strategic_suggestion # Default to the full suggestion
+                parsed_suggested_buttons = [] # Default to empty list
+
+                # Try to find the 'Suggested Buttons:' line and parse it
+                # Regex to find 'Suggested Buttons: [...]' case-insensitively and multiline
+                # It captures the JSON part for parsing.
+                button_match = re.search(r"^\s*Suggested Buttons:\s*(\[.*\])\s*$", strategic_suggestion, re.MULTILINE | re.IGNORECASE)
+                
+                if button_match:
+                    buttons_json_str = button_match.group(1)
+                    try:
+                        parsed_suggested_buttons = json.loads(buttons_json_str)
+                        # Validate that it's a list of strings, if not, revert to empty
+                        if not (isinstance(parsed_suggested_buttons, list) and \
+                                all(isinstance(btn, str) for btn in parsed_suggested_buttons)):
+                            logger.warning(f"Parsed buttons are not a list of strings: {parsed_suggested_buttons}. Reverting to empty list.")
+                            parsed_suggested_buttons = []
+                        else:
+                            logger.info(f"Successfully parsed suggested buttons: {parsed_suggested_buttons}")
+                            # Remove the button line from the textual advice for clarity
+                            textual_strategic_advice = strategic_suggestion.replace(button_match.group(0), "").strip()
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode JSON for suggested buttons: {buttons_json_str}. Keeping full text as advice.")
+                        # parsed_suggested_buttons remains []
+                else:
+                    logger.info("No 'Suggested Buttons:' line found in strategist output. Full text is advice.")
+                
+                logger.info(f"Textual Strategic Advice: {textual_strategic_advice}")
+                logger.info(f"Parsed Suggested Buttons: {parsed_suggested_buttons}")
+                # --- End Parsing Strategist LLM Output ---
+                
                 user_content_parts.append(f"Current Observation (from Vision Model):\n{visual_description}")
                 if current_collision_map_str: # Add collision map directly if it exists
                     user_content_parts.append(f"Current Collision Map:\n{current_collision_map_str}")
                 user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}")
+                
+                # Incorporate the parsed Strategist LLM output into the user content for the Tactical Action LLM
+                user_content_parts.append(f"Strategic Guidance (from Assistant Strategist):\n{textual_strategic_advice}")
+
+                if parsed_suggested_buttons: # Only add if buttons were successfully parsed and are not empty
+                    user_content_parts.append(f"Strategist's Suggested Buttons: {str(parsed_suggested_buttons)}")
+                else:
+                    user_content_parts.append("Strategist's Suggested Buttons: None provided or parsing failed.")
+                
+                user_content_parts.append(
+                    "Now, considering all the above (previous action, current observation, memory, strategic guidance, and any suggested buttons), "
+                    "explain your reasoning and choose your next action (e.g., button presses)."
+                )
 
                 final_user_content_string = "\n\n".join(user_content_parts)
 
@@ -388,7 +507,7 @@ class SimpleAgent:
                     max_tokens=MAX_TOKENS,
                     messages=payload_messages,
                     tools=AVAILABLE_TOOLS,
-                    tool_choice="auto", 
+                    tool_choice="required", 
                     temperature=TEMPERATURE,
                 )
 
@@ -511,15 +630,15 @@ class SimpleAgent:
         
         logger.info(f"[Agent] Game Progress Summary:\n{summary_text}")
         
+        new_user_message_content = (
+            f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
+            f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
+            "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing."
+        )
         self.message_history = [
             {
-                "role": "user", 
-                "content": [
-                    # Ensure the user message created after summary is a single string.
-                    (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
-                     f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
-                     "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                ]
+                "role": "user",
+                "content": new_user_message_content # CONTENT IS NOW THE STRING ITSELF
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
