@@ -20,6 +20,7 @@ from openai import OpenAI # Added
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+STRATEGIST_SYSTEM_PROMPT = """You are an expert Pokemon Red strategist. Based on the current game observation (visuals, memory, map), suggest the best high-level strategy or next immediate objective to make meaningful progress in the game. Focus on achieving long-term goals like defeating gym leaders, completing story objectives, or acquiring key items/Pokemon. Your suggestion should be a concise textual description of a strategy or objective, not specific button presses. For example: 'Try to leave the current building' or 'Explore the tall grass to find a new Pokemon' or 'Head towards the next town by going east'."""
 
 def get_screenshot_base64(screenshot, upscale=1):
     """Convert PIL image to base64 string."""
@@ -42,7 +43,7 @@ Your primary goal is to play through Pokemon Red and eventually defeat the Elite
 
 Early in the game (like when you first start or are in a new building), your objective is often to explore your immediate surroundings and find a way to the next area. This might involve looking for doors, stairs, or paths leading outwards. Pay attention to the 'Valid Moves' information from your memory, as it indicates directions you can immediately move.
 
-Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands. Consider your current objective, the available information (visuals, memory, valid moves), and your recent action history when deciding.
+Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands. Consider your current objective, the available information (visuals, memory, valid moves), any strategic guidance provided, and your recent action history when deciding.
 
 The conversation history may occasionally be summarized to save context space. If you see a message labeled "CONVERSATION HISTORY SUMMARY", this contains the key information about your progress so far. Use this information to maintain continuity in your gameplay."""
 
@@ -344,10 +345,61 @@ class SimpleAgent:
                     current_memory_info,
                     current_collision_map_str # Pass it to vision model as before
                 )
+
+                # --- Begin Strategist LLM Call ---
+                strategic_suggestion = "No strategic suggestion obtained." # Default fallback
+                try:
+                    logger.info(f"Calling Strategist LLM ({ACTION_MODEL_NAME}) for strategic suggestion...")
+                    strategist_user_message_content = (
+                        f"Current Observation (from Vision Model):\n{visual_description}\n\n"
+                        f"Relevant Game Memory:\n{current_memory_info}\n\n"
+                    )
+                    if current_collision_map_str:
+                        strategist_user_message_content += f"Current Collision Map:\n{current_collision_map_str}\n\n"
+                    
+                    strategist_user_message_content += "Based on this, what is your strategic suggestion?"
+
+                    strategist_messages = [
+                        {"role": "system", "content": STRATEGIST_SYSTEM_PROMPT},
+                        {"role": "user", "content": strategist_user_message_content}
+                    ]
+                    
+                    # Transform messages for the Strategist LLM call
+                    transformed_strategist_messages = self._transform_messages_for_action_model(strategist_messages)
+
+                    strategist_response = self.client.chat.completions.create(
+                        model=ACTION_MODEL_NAME,
+                        messages=transformed_strategist_messages,
+                        max_tokens=MAX_TOKENS, # Or a more modest number if suggestions are short
+                        temperature=TEMPERATURE,
+                        # tools=None, # Explicitly no tools for strategist
+                        # tool_choice=None 
+                    )
+                    
+                    if strategist_response.choices and strategist_response.choices[0].message.content:
+                        strategic_suggestion = strategist_response.choices[0].message.content.strip()
+                        logger.info(f"Strategic Suggestion: {strategic_suggestion}")
+                        if strategist_response.usage:
+                            logger.info(f"Strategist LLM usage: Input tokens: {strategist_response.usage.prompt_tokens}, Output tokens: {strategist_response.usage.completion_tokens}")
+                    else:
+                        logger.warning("Strategist LLM returned no content or empty choices.")
+                
+                except Exception as e:
+                    logger.error(f"Error calling Strategist LLM ({ACTION_MODEL_NAME}): {e}", exc_info=True)
+                    strategic_suggestion = "Error obtaining strategic suggestion." # Fallback on error
+                # --- End Strategist LLM Call ---
+                
                 user_content_parts.append(f"Current Observation (from Vision Model):\n{visual_description}")
                 if current_collision_map_str: # Add collision map directly if it exists
                     user_content_parts.append(f"Current Collision Map:\n{current_collision_map_str}")
                 user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}")
+                
+                # Incorporate the strategic_suggestion into the user content for the Tactical Action LLM
+                user_content_parts.append(
+                    f"Strategic Guidance: {strategic_suggestion}\n\n"
+                    "Now, considering this guidance, your current observation, and memory, "
+                    "explain your reasoning and choose your next action (e.g., button presses)."
+                )
 
                 final_user_content_string = "\n\n".join(user_content_parts)
 
