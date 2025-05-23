@@ -211,7 +211,7 @@ class SimpleAgent:
             response = self.client.chat.completions.create(
                 model=VISION_MODEL_NAME,
                 messages=messages,
-                max_tokens=500, # Max tokens for the vision model's description
+                max_tokens=MAX_TOKENS, # Max tokens for the vision model's description
                 temperature=TEMPERATURE # Can use the global temperature or a specific one for vision
             )
             
