@@ -36,9 +36,11 @@ def get_screenshot_base64(screenshot, upscale=1):
 
 SYSTEM_PROMPT = """You are playing Pokemon Red. You can see the game screen and control the game by executing emulator commands.
 
-Your goal is to play through Pokemon Red and eventually defeat the Elite Four. Make decisions based on what you see on the screen.
+Your primary goal is to play through Pokemon Red and eventually defeat the Elite Four. Make decisions based on what you see on the screen and the information from your game memory.
 
-Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands.
+Early in the game (like when you first start or are in a new building), your objective is often to explore your immediate surroundings and find a way to the next area. This might involve looking for doors, stairs, or paths leading outwards. Pay attention to the 'Valid Moves' information from your memory, as it indicates directions you can immediately move.
+
+Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands. Consider your current objective and the available information (visuals, memory, valid moves) when deciding.
 
 The conversation history may occasionally be summarized to save context space. If you see a message labeled "CONVERSATION HISTORY SUMMARY", this contains the key information about your progress so far. Use this information to maintain continuity in your gameplay."""
 
@@ -171,7 +173,7 @@ class SimpleAgent:
         """
         logger.info(f"Calling Vision Model ({VISION_MODEL_NAME}) to get visual context...")
         
-        vision_system_prompt = "You are an expert at analyzing game screenshots and memory data for a Pokemon game. You will receive up to three sequential game screenshots: the latest, the one before it, and the one before that. Describe the visual elements, player status, any noticeable changes or movement across the frames, and any relevant information from the memory data that would be useful for deciding the next game action. Focus on what the player character sees and can interact with. If a collision map is provided, mention any obvious barriers or paths based on it."
+        vision_system_prompt = "You are an expert at analyzing game screenshots and memory data for a Pokemon game. You will receive up to three sequential game screenshots (oldest to newest), memory data, and optionally a collision map.\nYour task is to:\n1.  Describe the general type of environment (e.g., 'small room', 'hallway', 'outdoors', 'cave').\n2.  Identify and describe any potential exits from the current view, such as doors, doorways, stairs, or paths leading off-screen. Specify their apparent direction (e.g., 'door to the south', 'stairs going up on the east side', 'path leading west').\n3.  Describe other key visual elements, player status, and any noticeable changes or movement across the frames.\n4.  Incorporate any relevant information from the memory data that would be useful for deciding the next game action.\n5.  If a collision map is provided, use it to confirm visible paths or barriers, and mention any obvious paths based on it, especially if they align with potential exits.\nFocus on what the player character sees, can interact with, or might use to navigate. Be concise but thorough."
         
         user_content = [{"type": "text", "text": "Here are the recent game screenshots (oldest to newest), memory data, and optionally a collision map:"}]
         
@@ -332,10 +334,12 @@ class SimpleAgent:
                 visual_description = self.get_visual_context_for_action_model(
                     list(self.image_history), 
                     current_memory_info,
-                    current_collision_map_str
+                    current_collision_map_str # Pass it to vision model as before
                 )
-                user_content_parts.append(f"Current Observation:\n{visual_description}")
-                user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}") # Add memory info as part of the string
+                user_content_parts.append(f"Current Observation (from Vision Model):\n{visual_description}")
+                if current_collision_map_str: # Add collision map directly if it exists
+                    user_content_parts.append(f"Current Collision Map:\n{current_collision_map_str}")
+                user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}")
 
                 final_user_content_string = "\n\n".join(user_content_parts)
 
