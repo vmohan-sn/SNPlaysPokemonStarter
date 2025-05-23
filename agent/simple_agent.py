@@ -2,8 +2,10 @@ import base64
 import collections
 import copy
 import io
+import json # Added for parsing suggested buttons
 import logging
 import os
+import re # Added for parsing suggested buttons
 
 # Updated config import
 from config import (
@@ -20,7 +22,18 @@ from openai import OpenAI # Added
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-STRATEGIST_SYSTEM_PROMPT = """You are an expert Pokemon Red strategist. Based on the current game observation (visuals, memory, map), suggest the best high-level strategy or next immediate objective to make meaningful progress in the game. Focus on achieving long-term goals like defeating gym leaders, completing story objectives, or acquiring key items/Pokemon. Your suggestion should be a concise textual description of a strategy or objective, not specific button presses. For example: 'Try to leave the current building' or 'Explore the tall grass to find a new Pokemon' or 'Head towards the next town by going east'."""
+STRATEGIST_SYSTEM_PROMPT = """You are an expert Pokemon Red strategist. Your goal is to help the player make progress by defining immediate objectives and suggesting how to achieve them.
+
+Based on the current game observation (visuals, memory, map), you must:
+1.  Define the most critical immediate short-term objective. Be very specific (e.g., "My immediate objective is to exit this room through the door visible at the top of the screen." or "My immediate objective is to talk to the person standing in front of me.").
+2.  Briefly explain how this short-term objective contributes to long-term game progress (e.g., "This is necessary to start exploring Pallet Town and eventually receive my first Pokemon." or "This person might give me a crucial item or information to advance the story.").
+3.  Propose a specific sequence of button presses that you believe will achieve this immediate short-term objective. The button presses MUST be formatted as a JSON list of strings on a line that starts with 'Suggested Buttons: '. For example: `Suggested Buttons: ["up", "up", "a"]`.
+
+Your entire response should be a single text block.
+
+Example response:
+My immediate objective is to exit this room through the door visible at the top of the screen. This is the first step to explore Pallet Town and begin my Pokemon journey.
+Suggested Buttons: ["up", "up", "up"]"""
 
 def get_screenshot_base64(screenshot, upscale=1):
     """Convert PIL image to base64 string."""
@@ -39,11 +52,21 @@ SYSTEM_PROMPT = """You are playing Pokemon Red. You can see the game screen and 
 
 Your primary goal is to play through Pokemon Red and eventually defeat the Elite Four. Make decisions based on what you see on the screen and the information from your game memory.
 
-**Self-Correction and Learning:** If you notice your recent actions are not leading to meaningful progress (e.g., the environment doesn't change, you're repeatedly blocked, or you're not achieving your immediate objective), actively try different strategies. Re-evaluate the visual information, collision map, and memory data. If one approach (like moving in a specific direction repeatedly) isn't working, try alternative button presses, exploring different directions, or interacting with different objects.
+**Strategist Input and Your Role:**
+You will be provided with strategic guidance (a textual description of a short-term objective and its relevance) and potentially a *suggested button sequence* from a planning assistant (Strategist LLM). Your task is to critically analyze the current game state (screen, memory, map), the textual strategic guidance, and any suggested button sequence.
+
+Your decision-making process before each action should be:
+1.  **Understand the Goal:** Review the textual strategic guidance to understand the immediate short-term objective.
+2.  **Evaluate Suggested Buttons:** If a button sequence is suggested by the Strategist, assess its appropriateness and effectiveness in achieving the stated objective, considering the current visual information, memory, and map.
+3.  **Decide on Action:**
+    *   If the suggested buttons are good and directly help achieve the stated short-term goal, you should generally use them.
+    *   However, you have the authority to *deviate* from, *correct*, or *replace* the suggested buttons if they seem incorrect, inefficient, conflict with the current game state, or if you identify a better sequence to achieve the goal. Your own assessment of the live game state takes precedence.
+4.  **Explain Reasoning:** Briefly explain your reasoning for the chosen action, including why you are following, modifying, or disregarding any suggested buttons.
+5.  **Execute Action:** Your final output must be a tool call for the chosen button presses, using the 'press_buttons' tool (or 'navigate_to' if appropriate and available).
+
+**Self-Correction and Learning:** If you notice your recent actions are not leading to meaningful progress (e.g., the environment doesn't change, you're repeatedly blocked, or you're not achieving your immediate objective), actively try different strategies. Re-evaluate the visual information, collision map, memory data, and the Strategist's advice. If one approach isn't working, try alternative button presses, exploring different directions, or interacting with different objects.
 
 Early in the game (like when you first start or are in a new building), your objective is often to explore your immediate surroundings and find a way to the next area. This might involve looking for doors, stairs, or paths leading outwards. Pay attention to the 'Valid Moves' information from your memory, as it indicates directions you can immediately move.
-
-Before each action, explain your reasoning briefly, then use the emulator tool to execute your chosen commands. Consider your current objective, the available information (visuals, memory, valid moves), any strategic guidance provided, and your recent action history when deciding.
 
 The conversation history may occasionally be summarized to save context space. If you see a message labeled "CONVERSATION HISTORY SUMMARY", this contains the key information about your progress so far. Use this information to maintain continuity in your gameplay."""
 
@@ -388,16 +411,54 @@ class SimpleAgent:
                     logger.error(f"Error calling Strategist LLM ({ACTION_MODEL_NAME}): {e}", exc_info=True)
                     strategic_suggestion = "Error obtaining strategic suggestion." # Fallback on error
                 # --- End Strategist LLM Call ---
+
+                # --- Parse Strategist LLM Output ---
+                textual_strategic_advice = strategic_suggestion # Default to the full suggestion
+                parsed_suggested_buttons = [] # Default to empty list
+
+                # Try to find the 'Suggested Buttons:' line and parse it
+                # Regex to find 'Suggested Buttons: [...]' case-insensitively and multiline
+                # It captures the JSON part for parsing.
+                button_match = re.search(r"^\s*Suggested Buttons:\s*(\[.*\])\s*$", strategic_suggestion, re.MULTILINE | re.IGNORECASE)
+                
+                if button_match:
+                    buttons_json_str = button_match.group(1)
+                    try:
+                        parsed_suggested_buttons = json.loads(buttons_json_str)
+                        # Validate that it's a list of strings, if not, revert to empty
+                        if not (isinstance(parsed_suggested_buttons, list) and \
+                                all(isinstance(btn, str) for btn in parsed_suggested_buttons)):
+                            logger.warning(f"Parsed buttons are not a list of strings: {parsed_suggested_buttons}. Reverting to empty list.")
+                            parsed_suggested_buttons = []
+                        else:
+                            logger.info(f"Successfully parsed suggested buttons: {parsed_suggested_buttons}")
+                            # Remove the button line from the textual advice for clarity
+                            textual_strategic_advice = strategic_suggestion.replace(button_match.group(0), "").strip()
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode JSON for suggested buttons: {buttons_json_str}. Keeping full text as advice.")
+                        # parsed_suggested_buttons remains []
+                else:
+                    logger.info("No 'Suggested Buttons:' line found in strategist output. Full text is advice.")
+                
+                logger.info(f"Textual Strategic Advice: {textual_strategic_advice}")
+                logger.info(f"Parsed Suggested Buttons: {parsed_suggested_buttons}")
+                # --- End Parsing Strategist LLM Output ---
                 
                 user_content_parts.append(f"Current Observation (from Vision Model):\n{visual_description}")
                 if current_collision_map_str: # Add collision map directly if it exists
                     user_content_parts.append(f"Current Collision Map:\n{current_collision_map_str}")
                 user_content_parts.append(f"Relevant Game Memory:\n{current_memory_info}")
                 
-                # Incorporate the strategic_suggestion into the user content for the Tactical Action LLM
+                # Incorporate the parsed Strategist LLM output into the user content for the Tactical Action LLM
+                user_content_parts.append(f"Strategic Guidance (from Assistant Strategist):\n{textual_strategic_advice}")
+
+                if parsed_suggested_buttons: # Only add if buttons were successfully parsed and are not empty
+                    user_content_parts.append(f"Strategist's Suggested Buttons: {str(parsed_suggested_buttons)}")
+                else:
+                    user_content_parts.append("Strategist's Suggested Buttons: None provided or parsing failed.")
+                
                 user_content_parts.append(
-                    f"Strategic Guidance: {strategic_suggestion}\n\n"
-                    "Now, considering this guidance, your current observation, and memory, "
+                    "Now, considering all the above (previous action, current observation, memory, strategic guidance, and any suggested buttons), "
                     "explain your reasoning and choose your next action (e.g., button presses)."
                 )
 
