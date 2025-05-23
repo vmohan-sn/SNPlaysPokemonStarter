@@ -433,7 +433,7 @@ class SimpleAgent:
                 if assistant_response_content_for_history: 
                     self.message_history.append({ # Add assistant's turn to history
                         "role": "assistant",
-                        "content": assistant_response_content_for_history # This can be a list of text/tool_call parts
+                        "content": f"{assistant_response_content_for_history}" # This can be a list of text/tool_call parts
                     })
                 
                 if tool_calls_from_response:
@@ -507,7 +507,7 @@ class SimpleAgent:
                     (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
                      f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
                      "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                )
+                ]
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
