@@ -1,5 +1,8 @@
 # Configuration for the application
-MODEL_NAME = "claude-3-7-sonnet-20250219"
+VISION_MODEL_NAME = "Llama-4-Maverick-17B-128E-Instruct"
+ACTION_MODEL_NAME = "DeepSeek-V3-0324"
+SAMBANOVA_API_KEY = "YOUR_SAMBANOVA_API_KEY_NEEDS_TO_BE_SET"
+SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1"
 TEMPERATURE = 1.0
 MAX_TOKENS = 4000
 
