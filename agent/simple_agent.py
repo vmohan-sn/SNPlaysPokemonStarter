@@ -173,17 +173,23 @@ class SimpleAgent:
 
             if role in ["user", "system"]:
                 if isinstance(content, list):
-                    # Attempt to extract text from list structure
-                    # Common structure: [{"type": "text", "text": "..."}]
-                    text_content = ""
+                    text_content_parts = []
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text" and "text" in item:
-                            text_content += item["text"] + "\n" # Concatenate if multiple text parts
-                    text_content = text_content.strip()
-                    if not text_content: # Fallback if list is empty or no text parts found
-                        logger.warning(f"User/System message content list did not yield text: {content}")
-                        text_content = str(content) 
-                    transformed_messages.append({"role": role, "content": text_content})
+                            text_content_parts.append(item["text"])
+                        elif isinstance(item, str): # New condition
+                            text_content_parts.append(item)
+                        # Else: item is neither a text dict nor a string, potentially log or ignore
+                    
+                    if not text_content_parts:
+                        logger.warning(f"User/System message content list {content} yielded no text parts.")
+                        # Fallback to string representation of the original list, though this path should be less likely now.
+                        final_text_content = str(content) 
+                    else:
+                        # Join the parts. Use "\n" if multiple parts, otherwise just the single part.
+                        final_text_content = "\n".join(text_content_parts).strip()
+
+                    transformed_messages.append({"role": role, "content": final_text_content})
                 elif isinstance(content, str):
                     transformed_messages.append({"role": role, "content": content})
                 else:
@@ -624,15 +630,15 @@ class SimpleAgent:
         
         logger.info(f"[Agent] Game Progress Summary:\n{summary_text}")
         
+        new_user_message_content = (
+            f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
+            f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
+            "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing."
+        )
         self.message_history = [
             {
-                "role": "user", 
-                "content": [
-                    # Ensure the user message created after summary is a single string.
-                    (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
-                     f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
-                     "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                ]
+                "role": "user",
+                "content": new_user_message_content # CONTENT IS NOW THE STRING ITSELF
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
