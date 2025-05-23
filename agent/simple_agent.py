@@ -1,4 +1,5 @@
 import base64
+import collections
 import copy
 import io
 import logging
@@ -126,6 +127,7 @@ class SimpleAgent:
         # Initial message content is a string.
         self.message_history = [{"role": "user", "content": "You may now begin playing. Describe what you see and what you plan to do."}]
         self.max_history = max_history
+        self.image_history = collections.deque(maxlen=3)
         if load_state:
             logger.info(f"Loading saved state from {load_state}")
             self.emulator.load_state(load_state)
@@ -163,22 +165,36 @@ class SimpleAgent:
                 transformed_messages.append(msg) # Keep as is
         return transformed_messages
 
-    def get_visual_context_for_action_model(self, screenshot_b64: str, memory_info: str, collision_map_str: str = None) -> str:
+    def get_visual_context_for_action_model(self, screenshots_b64: list[str], memory_info: str, collision_map_str: str = None) -> str:
         """
         Calls the VISION_MODEL_NAME to get a textual description of the game state including screen, memory, and collision map.
         """
         logger.info(f"Calling Vision Model ({VISION_MODEL_NAME}) to get visual context...")
         
-        vision_system_prompt = "You are an expert at analyzing game screenshots and memory data for a Pokemon game. Describe the visual elements, player status, and any relevant information from the memory data that would be useful for deciding the next game action. Focus on what the player character sees and can interact with. If a collision map is provided, mention any obvious barriers or paths based on it."
+        vision_system_prompt = "You are an expert at analyzing game screenshots and memory data for a Pokemon game. You will receive up to three sequential game screenshots: the latest, the one before it, and the one before that. Describe the visual elements, player status, any noticeable changes or movement across the frames, and any relevant information from the memory data that would be useful for deciding the next game action. Focus on what the player character sees and can interact with. If a collision map is provided, mention any obvious barriers or paths based on it."
         
-        user_content = [
-            {"type": "text", "text": "Here's the current game screenshot, memory data, and optionally a collision map:"},
-            {
+        user_content = [{"type": "text", "text": "Here are the recent game screenshots (oldest to newest), memory data, and optionally a collision map:"}]
+        
+        image_list_for_api = list(screenshots_b64) # screenshots_b64 is a deque, so this is [oldest, ..., newest]
+        
+        if len(image_list_for_api) == 3:
+            labels = ["Oldest game screenshot:", "Previous game screenshot:", "Latest game screenshot:"]
+        elif len(image_list_for_api) == 2:
+            labels = ["Older game screenshot:", "Latest game screenshot:"]
+        elif len(image_list_for_api) == 1:
+            labels = ["Current game screenshot:"]
+        else:
+            labels = [] # Should ideally not happen
+
+        for i, b64_data in enumerate(image_list_for_api):
+            if i < len(labels):
+                user_content.append({"type": "text", "text": labels[i]})
+            user_content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
-            },
-            {"type": "text", "text": f"Memory data: {memory_info}"}
-        ]
+                "image_url": {"url": f"data:image/png;base64,{b64_data}"}
+            })
+            
+        user_content.append({"type": "text", "text": f"Memory data: {memory_info}"})
         if collision_map_str:
             user_content.append({"type": "text", "text": f"Collision Map (player is 'P', obstacles are 'X', free space is '.'):\n{collision_map_str}"})
 
@@ -280,11 +296,12 @@ class SimpleAgent:
             logger.info("Augmenting initial message with visual context...")
             screenshot = self.emulator.get_screenshot()
             screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
+            self.image_history.append(screenshot_b64)
             memory_info = self.emulator.get_state_from_memory()
             collision_map = self.emulator.get_collision_map()
             collision_map_str = f"\n{collision_map}" if collision_map else ""
             
-            initial_visual_description = self.get_visual_context_for_action_model(screenshot_b64, memory_info, collision_map_str)
+            initial_visual_description = self.get_visual_context_for_action_model(list(self.image_history), memory_info, collision_map_str)
             
             # Augment the initial user message string with the first visual description.
             self.message_history[0]["content"] += f"\n\nInitial Observation:\n{initial_visual_description}"
@@ -307,12 +324,13 @@ class SimpleAgent:
                 # Get current visual and memory context
                 current_screenshot = self.emulator.get_screenshot()
                 current_screenshot_b64 = get_screenshot_base64(current_screenshot, upscale=2)
+                self.image_history.append(current_screenshot_b64)
                 current_memory_info = self.emulator.get_state_from_memory() # String from emulator
                 current_collision_map = self.emulator.get_collision_map()
                 current_collision_map_str = f"\n{current_collision_map}" if current_collision_map else ""
                 
                 visual_description = self.get_visual_context_for_action_model(
-                    current_screenshot_b64, 
+                    list(self.image_history), 
                     current_memory_info,
                     current_collision_map_str
                 )
@@ -415,7 +433,7 @@ class SimpleAgent:
                 if assistant_response_content_for_history: 
                     self.message_history.append({ # Add assistant's turn to history
                         "role": "assistant",
-                        "content": assistant_response_content_for_history # This can be a list of text/tool_call parts
+                        "content": f"{assistant_response_content_for_history}" # This can be a list of text/tool_call parts
                     })
                 
                 if tool_calls_from_response:
@@ -454,10 +472,11 @@ class SimpleAgent:
         # Get current visual context as text description for the summary
         screenshot = self.emulator.get_screenshot()
         screenshot_b64 = get_screenshot_base64(screenshot, upscale=2)
+        self.image_history.append(screenshot_b64) # Add latest screenshot to history
         memory_info = self.emulator.get_state_from_memory()
         collision_map = self.emulator.get_collision_map()
         collision_map_str = f"\n{collision_map}" if collision_map else ""
-        current_visual_text_description = self.get_visual_context_for_action_model(screenshot_b64, memory_info, collision_map_str)
+        current_visual_text_description = self.get_visual_context_for_action_model(list(self.image_history), memory_info, collision_map_str)
         
         summary_request_messages = copy.deepcopy(self.message_history)
         summary_request_messages.append({ 
@@ -488,7 +507,7 @@ class SimpleAgent:
                     (f"CONVERSATION HISTORY SUMMARY (representing up to {self.max_history} previous messages):\n{summary_text}"
                      f"\n\nLatest Game Context (after summary):\n{current_visual_text_description}"
                      "\n\nYou were just asked to summarize your playthrough. The summary and current game context are above. Continue playing.")
-                )
+                ]
             }
         ]
         logger.info(f"[Agent] Message history condensed. New length: {len(self.message_history)}")
